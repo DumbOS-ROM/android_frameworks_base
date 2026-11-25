@@ -1492,8 +1492,24 @@ public class ComputerEngine implements Computer {
                 p.getSigningDetails(), new Signature[]{MICROG_REAL_SIGNATURE});
     }
 
-    private static Optional<Signature> generateFakeSignature(AndroidPackage p) {
-        if (!isMicrogSigned(p)) {
+    private boolean isMicrogPackageAllowed(@NonNull AndroidPackage p,
+            @Nullable PackageStateInternal ps) {
+        final String pkgName = p.getPackageName();
+        if (!"com.android.vending".equals(pkgName) && !"com.google.android.gms".equals(pkgName)) {
+            return false;
+        }
+        // Accept preinstalled priv-app microG packages (supports ABI-stripped APKs re-signed
+        // with ROM keys) as well as updates signed with upstream NOGAPPS certificate.
+        final PackageStateInternal state = ps != null ? ps : getPackageStateInternal(pkgName);
+        if (state != null && state.isSystem() && state.isPrivileged()) {
+            return true;
+        }
+        return isMicrogSigned(p);
+    }
+
+    private Optional<Signature> generateFakeSignature(@NonNull AndroidPackage p,
+            @Nullable PackageStateInternal ps) {
+        if (!isMicrogPackageAllowed(p, ps)) {
             return Optional.empty();
         }
 
@@ -1514,6 +1530,24 @@ public class ComputerEngine implements Computer {
         }
 
         return Optional.of(fakeSignature);
+    }
+
+    private SigningDetails getEffectiveSigningDetails(@NonNull AndroidPackage p,
+            @Nullable PackageStateInternal ps, @NonNull SigningDetails fallback) {
+        final Optional<Signature> fakeSig = generateFakeSignature(p, ps);
+        if (fakeSig.isPresent()) {
+            try {
+                final Signature[] sigs = new Signature[]{fakeSig.get()};
+                return new SigningDetails(
+                        sigs,
+                        SigningDetails.SignatureSchemeVersion.SIGNING_BLOCK_V3,
+                        SigningDetails.toSigningKeys(sigs),
+                        null);
+            } catch (CertificateException e) {
+                Slog.e(TAG, "Caught an exception when creating spoofed signing details: ", e);
+            }
+        }
+        return fallback;
     }
 
     public final PackageInfo generatePackageInfo(PackageStateInternal ps,
@@ -1572,7 +1606,7 @@ public class ComputerEngine implements Computer {
                 }
             }
 
-            generateFakeSignature(p).ifPresent(fakeSignature -> {
+            generateFakeSignature(p, ps).ifPresent(fakeSignature -> {
                 packageInfo.signatures = new Signature[]{fakeSignature};
                 try {
                     packageInfo.signingInfo = new SigningInfo(
@@ -4275,7 +4309,9 @@ public class ComputerEngine implements Computer {
                 || shouldFilterApplicationIncludingUninstalled(ps2, callingUid, userId)) {
             return PackageManager.SIGNATURE_UNKNOWN_PACKAGE;
         }
-        return checkSignaturesInternal(p1.getSigningDetails(), p2.getSigningDetails());
+        return checkSignaturesInternal(
+                getEffectiveSigningDetails(p1, ps1, p1.getSigningDetails()),
+                getEffectiveSigningDetails(p2, ps2, p2.getSigningDetails()));
     }
 
     @Override
@@ -4329,7 +4365,10 @@ public class ComputerEngine implements Computer {
             if (shouldFilterApplicationIncludingUninstalled(ps, callingUid, userId)) {
                 return null;
             }
-            return ps.getSigningDetails();
+            final AndroidPackage pkg = ps.getPkg();
+            return pkg != null
+                    ? getEffectiveSigningDetails(pkg, ps, ps.getSigningDetails())
+                    : ps.getSigningDetails();
         }
         return null;
     }
@@ -4378,11 +4417,12 @@ public class ComputerEngine implements Computer {
                 || shouldFilterApplicationIncludingUninstalled(ps, callingUid, callingUserId)) {
             return false;
         }
+        final SigningDetails sd = getEffectiveSigningDetails(p, ps, p.getSigningDetails());
         switch (type) {
             case CERT_INPUT_RAW_X509:
-                return p.getSigningDetails().hasCertificate(certificate);
+                return sd.hasCertificate(certificate);
             case CERT_INPUT_SHA256:
-                return p.getSigningDetails().hasSha256Certificate(certificate);
+                return sd.hasSha256Certificate(certificate);
             default:
                 return false;
         }
